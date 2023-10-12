@@ -2,6 +2,7 @@ const express = require('express');
 const mysql = require('mysql');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const PDFDocument = require('pdfkit');
 
 const app = express();
 
@@ -22,6 +23,40 @@ db.connect((err) => {
   }
   console.log('MySQL connected...');
 });
+
+
+app.get('/generate-customer-report', (req, res) => {
+  const doc = new PDFDocument();
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline; filename=customerReport.pdf');
+
+  doc.pipe(res);
+
+  const query = `
+  SELECT c.customer_id, c.first_name, c.last_name, COUNT(r.rental_id) as total_rentals
+  FROM customer c
+  JOIN rental r ON c.customer_id = r.customer_id
+  GROUP BY c.customer_id, c.first_name, c.last_name;
+  
+  
+  `;
+
+  db.query(query, (error, results) => {
+    if (error) {
+      console.log('Error fetching customer report data:', error);
+      return;
+    }
+
+    results.forEach((row) => {
+      doc.text(`Customer ID: ${row.customer_id}, Name: ${row.first_name} ${row.last_name}, ...`);
+    });
+
+    doc.end();
+  });
+});
+
+
 
 
 app.get('/top-5-rented-movies', (req, res) => {
@@ -72,10 +107,6 @@ app.get('/top-actors', (req, res) => {
   });
 });
 
-
-app.listen(3000, () => {
-  console.log('Server started on port 3000');
-});
 // API endpoint to get all movies
 app.get('/all-movies', (req, res) => {
   const query = 'SELECT * FROM film';  // gets all movies
@@ -152,27 +183,26 @@ app.post('/rent-film', (req, res) => {
       res.json({ success: 'Film successfully rented', rentalId: results.insertId });
   });
 });
-
 app.post('/rent-movie', (req, res) => {
-  const { film_id, customer_id } = req.body;
-  
+  const { customer_id, film_id } = req.body;
   const rental_date = new Date();
-  const return_date = new Date();
-  return_date.setDate(return_date.getDate() + 7); 
-  
-  const query = `
-      INSERT INTO rental (rental_date, inventory_id, customer_id, return_date, staff_id)
-      VALUES (?, 1, ?, ?, 1);
+  const insertQuery = `
+    INSERT INTO rental (rental_date, inventory_id, customer_id, return_date, staff_id)
+    VALUES (?, 
+    (SELECT inventory_id FROM inventory WHERE film_id = ? LIMIT 1),
+    ?, NULL, 1)
   `;
 
-  db.query(query, [rental_date, customer_id, return_date], (error, results) => {
-      if (error) {
-          res.status(500).json({ error: 'An error occurred while renting the movie' });
-          return;
-      }
-      res.json({ success: 'Movie successfully rented' });
+  db.query(insertQuery, [rental_date, film_id, customer_id], (error, results) => {
+    if (error) {
+      console.error('Error in rent-movie:', error);
+      res.status(500).json({ success: false });
+    } else {
+      res.json({ success: true });
+    }
   });
 });
+
 
 app.get('/customers', (req, res) => {
   let page = parseInt(req.query.page) || 1;
@@ -195,42 +225,184 @@ app.get('/customers', (req, res) => {
     res.json(results);
   });
 });
-
-
-
-// API endpoint to fetch individual customer details
 app.get('/customer-details/:customer_id', (req, res) => {
   const customer_id = req.params.customer_id;
-  const query = 'SELECT * FROM customer WHERE customer_id = ?';
-  db.query(query, [customer_id], (error, results) => {
+  let customerDetails = {};
+
+  const customerQuery = 'SELECT * FROM customer WHERE customer_id = ?';
+  db.query(customerQuery, [customer_id], (error, results) => {
     if (error) {
       res.status(500).json({ error: 'An error occurred while fetching data' });
       return;
     }
-    res.json(results[0]);
+
+    customerDetails = results[0];
+const rentedMoviesQuery = `SELECT 
+film.title,
+rental.return_date, -- Include return_date in the result set
+CASE
+    WHEN rental.return_date IS NULL THEN 'Rented'
+    ELSE 'Returned'
+END AS rental_status
+FROM rental
+JOIN inventory ON rental.inventory_id = inventory.inventory_id
+JOIN film ON inventory.film_id = film.film_id
+WHERE rental.customer_id = ?
+`;
+
+db.query(rentedMoviesQuery, [customer_id], (error, movies) => {
+  if (error) {
+    res.status(500).json({ error: 'An error occurred while fetching rented movies' });
+    return;
+  }
+  
+  const rentedMovies = movies.filter(movie => movie.return_date === null).map(movie => movie.title);
+  const returnedMovies = movies.filter(movie => movie.return_date !== null).map(movie => movie.title);
+
+  customerDetails.rentedMovies = rentedMovies;
+  customerDetails.returnedMovies = returnedMovies;
+
+  res.json(customerDetails);
+  
+    });
   });
 });
+app.put('/edit-customer-rented-movies/:customer_id', (req, res) => {
+  const customer_id = req.params.customer_id;
+  const { rentedMovies } = req.body; 
 
-// API endpoint to add a new customer
-app.post('/add-customer', (req, res) => {
-  const { first_name, last_name, email, address } = req.body;
-  const query = 'INSERT INTO customer (first_name, last_name, email, address) VALUES (?, ?, ?, ?)';
-  db.query(query, [first_name, last_name, email, address], (error, results) => {
+  const deleteQuery = `
+    DELETE rental FROM rental
+    JOIN inventory ON rental.inventory_id = inventory.inventory_id
+    WHERE rental.customer_id = ? AND rental.return_date IS NULL
+  `;
+
+  db.query(deleteQuery, [customer_id], (error) => {
     if (error) {
-      res.status(500).json({ error: 'An error occurred while adding the customer' });
+      console.error("Error in deleteQuery:", error); 
+      res.status(500).json({ error: 'An error occurred while deleting existing rented movies' });
       return;
     }
-    res.json({ success: 'Customer successfully added', customerId: results.insertId });
+
+    const rental_date = new Date();
+    const insertQueries = rentedMovies.map(film_id => {
+      return `
+        INSERT INTO rental (rental_date, inventory_id, customer_id, return_date, staff_id)
+        VALUES ('${rental_date.toISOString().slice(0, 19).replace('T', ' ')}', 
+        (SELECT inventory_id FROM inventory WHERE film_id = ${film_id} LIMIT 1),
+        ${customer_id}, NULL, 1)
+      `;
+    });
+
+    Promise.all(insertQueries.map(q => {
+      return new Promise((resolve, reject) => {
+        db.query(q, (error, results) => {
+          if (error) {
+            console.error("Error in insertQuery:", error); 
+            reject(error);
+          }
+          else resolve(results);
+        });
+      });
+    }))
+    .then(() => {
+      res.json({ success: true });
+    })
+    .catch(error => {
+      console.error("Error in Promise.all:", error); 
+      res.status(500).json({ error: 'An error occurred while adding new rented movies' });
+    });
   });
 });
 
-// API endpoint to edit customer details
+app.put('/edit-customer-returned-movies/:customer_id', (req, res) => {
+  const customer_id = req.params.customer_id;
+  const { returnedMovies } = req.body; 
+  console.log(`Received customer_id: ${customer_id}`);
+  console.log(`Received returnedMovies: ${JSON.stringify(returnedMovies)}`);
+
+  const currentDate = new Date();
+  const fetchAndUpdateQueries = returnedMovies.map(film_id => {
+      return new Promise((resolve, reject) => {
+          const fetchQuery = `
+              SELECT rental.rental_id FROM rental
+              JOIN inventory ON rental.inventory_id = inventory.inventory_id
+              WHERE rental.customer_id = ? AND inventory.film_id = ? AND rental.return_date IS NULL
+          `;
+          db.query(fetchQuery, [customer_id, film_id], (error, results) => {
+              if (error) {
+                  console.error(`Error in fetchQuery: ${error}`);
+                  reject(error);
+              } else {
+                  if (results.length > 0) {
+                      const rental_id = results[0].rental_id;
+                      const updateQuery = `
+                          UPDATE rental
+                          SET return_date = ?
+                          WHERE rental_id = ?
+                      `;
+                      db.query(updateQuery, [currentDate.toISOString().slice(0, 19).replace('T', ' '), rental_id], (error) => {
+                          if (error) {
+                              console.error(`Error in updateQuery: ${error}`);
+                              reject(error);
+                          } else {
+                              resolve();
+                          }
+                      });
+                  } else {
+                      resolve();
+                  }
+              }
+          });
+      });
+  });
+
+  Promise.all(fetchAndUpdateQueries)
+      .then(() => {
+          res.json({ success: true });
+      })
+      .catch(error => {
+          console.error(`Error in Promise.all: ${error}`);
+          res.status(500).json({ error: 'An error occurred while updating returned movies' });
+      });
+});
+
+
 app.put('/edit-customer/:customer_id', (req, res) => {
   const customer_id = req.params.customer_id;
-  const { first_name, last_name, email, address } = req.body;
-  const query = 'UPDATE customer SET first_name = ?, last_name = ?, email = ?, address = ? WHERE customer_id = ?';
-  db.query(query, [first_name, last_name, email, address, customer_id], (error, results) => {
+  const { first_name, last_name, email } = req.body;
+  let query = 'UPDATE customer SET ';
+  let queryParams = [];
+  let first = true;
+
+  if (first_name !== undefined) {
+    query += (first ? '' : ', ') + 'first_name = ?';
+    queryParams.push(first_name);
+    first = false;
+  }
+
+  if (last_name !== undefined) {
+    query += (first ? '' : ', ') + 'last_name = ?';
+    queryParams.push(last_name);
+    first = false;
+  }
+
+  if (email !== undefined) {
+    query += (first ? '' : ', ') + 'email = ?';
+    queryParams.push(email);
+    first = false;
+  }
+
+  if (first) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+
+  query += ' WHERE customer_id = ?';
+  queryParams.push(customer_id);
+
+  db.query(query, queryParams, (error, results) => {
     if (error) {
+      console.error('Debug: SQL Error:', error);
       res.status(500).json({ error: 'An error occurred while editing the customer' });
       return;
     }
@@ -240,12 +412,74 @@ app.put('/edit-customer/:customer_id', (req, res) => {
 
 app.delete('/delete-customer/:customer_id', (req, res) => {
   const customer_id = req.params.customer_id;
-  const query = 'DELETE FROM customer WHERE customer_id = ?';
-  db.query(query, [customer_id], (error, results) => {
+  
+  const deleteQuery = 'DELETE FROM customer WHERE customer_id = ?';
+  db.query(deleteQuery, [customer_id], (error) => {
     if (error) {
       res.status(500).json({ error: 'An error occurred while deleting the customer' });
       return;
     }
-    res.json({ success: 'Customer successfully deleted' });
+    res.json({ success: 'Customer deleted successfully' });
   });
+});
+
+app.post('/add-customer', (req, res) => {
+  const { first_name, last_name, email } = req.body;
+
+  if (!first_name || !last_name || !email) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  const defaultStoreId = 1;
+  const defaultAddressId = 1;
+
+  const query = 'INSERT INTO customer (first_name, last_name, email, store_id, address_id) VALUES (?, ?, ?, ?, ?)';
+  db.query(query, [first_name, last_name, email, defaultStoreId, defaultAddressId], (error, results) => {
+    if (error) {
+      console.error('Error adding customer:', error);
+      return res.status(500).json({ error: 'An error occurred while adding the customer' });
+    }
+    res.json({ success: 'Customer successfully added', customerId: results.insertId });
+  });
+});
+
+app.put('/updateCustomerEmail/:id', (req, res) => {
+  const customerId = req.params.id;
+  const { email } = req.body;
+  const query = `UPDATE customer SET email = ? WHERE customer_id = ?`;
+  
+  db.query(query, [email, customerId], (err, result) => {
+    if (err) {
+      console.log(err);
+      res.json({ success: false, message: 'Failed to update email' });
+    } else {
+      res.json({ success: true, message: 'Email updated successfully' });
+    }
+  });
+});
+
+
+
+
+
+
+app.put('/updateCustomerFirstName/:id', (req, res) => {
+  const customerId = req.params.id;
+  const { first_name } = req.body;
+  const query = `UPDATE customer SET first_name = ? WHERE customer_id = ?`;
+  
+  db.query(query, [first_name, customerId], (err, result) => {
+    if (err) {
+      console.log(err);
+      res.json({ success: false, message: 'Failed to update first name' });
+    } else {
+      res.json({ success: true, message: 'First name updated successfully' });
+    }
+  });
+});
+
+
+
+app.listen(3000, () => {
+  console.log('Server started on port 3000');
 });
