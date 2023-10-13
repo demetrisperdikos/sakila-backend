@@ -1,3 +1,4 @@
+
 const express = require('express');
 const mysql = require('mysql');
 const cors = require('cors');
@@ -5,6 +6,7 @@ const bodyParser = require('body-parser');
 const PDFDocument = require('pdfkit');
 
 const app = express();
+
 
 app.use(bodyParser.json());
 
@@ -409,17 +411,26 @@ app.put('/edit-customer/:customer_id', (req, res) => {
     res.json({ success: 'Customer successfully edited' });
   });
 });
-
 app.delete('/delete-customer/:customer_id', (req, res) => {
   const customer_id = req.params.customer_id;
   
-  const deleteQuery = 'DELETE FROM customer WHERE customer_id = ?';
-  db.query(deleteQuery, [customer_id], (error) => {
+  // First, delete dependent records in the rental table
+  const deleteRentalQuery = 'DELETE FROM rental WHERE customer_id = ?';
+  db.query(deleteRentalQuery, [customer_id], (error) => {
     if (error) {
-      res.status(500).json({ error: 'An error occurred while deleting the customer' });
+      res.status(500).json({ error: 'An error occurred while deleting dependent rental records' });
       return;
     }
-    res.json({ success: 'Customer deleted successfully' });
+    
+    // Then, delete the customer
+    const deleteCustomerQuery = 'DELETE FROM customer WHERE customer_id = ?';
+    db.query(deleteCustomerQuery, [customer_id], (error) => {
+      if (error) {
+        res.status(500).json({ error: 'An error occurred while deleting the customer' });
+        return;
+      }
+      res.json({ success: 'Customer deleted successfully' });
+    });
   });
 });
 
@@ -479,7 +490,9 @@ app.put('/updateCustomerFirstName/:id', (req, res) => {
 });
 
 
-
-app.listen(3000, () => {
+const server = app.listen(3000, () => {
   console.log('Server started on port 3000');
 });
+
+module.exports = server;
+module.exports.db = db;
